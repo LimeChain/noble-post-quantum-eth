@@ -1182,6 +1182,7 @@ function ApproxExp(x: number, ccs: number): number {
 }
 
 // Actual api
+type HashToPointFn = (nonce: Uint8Array, msg: Uint8Array) => Uint16Array;
 type FalconOpts = {
   N: number;
   // Table 3.3 total padded detached bytes; kept as reference config, not read by genFalcon() today.
@@ -1198,6 +1199,7 @@ type FalconOpts = {
   // `s2` length, while signRaw() enforces `maxS2Len` separately.
   detachedLen: number;
   maxS2Len: number;
+  hashToPoint?: HashToPointFn;
 };
 
 type FalconRandom = (bytesLength?: number) => TRet<Uint8Array>;
@@ -1749,33 +1751,34 @@ function genFalcon(opts: FalconOpts): TRet<Falcon> {
     cleanBytes(t1, t2, tt);
     return G;
   }
-  function HashToPoint(nonce: TArg<Uint8Array>, msg: TArg<Uint8Array>): TRet<IPoly> {
-    // Algorithm 3: HashToPoint(str, q, n)
-    // (Page 31)
-    // Require: A string str, a modulus q ≤ 2¹⁶, a degree n ∈ N*
-    // Ensure: An polynomial c = Σᵢ cᵢxⁱ in Zq[x]
-    // 1: k ← ⌈2¹⁶/q⌉
-    // 2: ctx ← SHAKE-256-Init()
-    // 3: SHAKE-256-Inject(ctx, str)
-    // 4: i ← 0
-    // 5: while i < n do
-    // 6:     t ← SHAKE-256-Extract(ctx, 16)
-    // 7:     if t < kq then
-    // 8:         cᵢ ← t mod q
-    // 9:         i ← i + 1
-    // 10: return c
-    const h = shake256.create().update(nonce).update(msg); // 3: SHAKE-256-Inject(ctx, str)
-    const c = new Uint16Array(N);
-    // Round-3 Falcon keeps 16-bit draws only in 0..61444, i.e. below 61445 = 5*q, the largest
-    // 16-bit multiple of q below 2^16; a literal ceil(2^16/q)*q would accept every sample.
-    const kQ = 5 * Q;
-    for (let i = 0; i < N; ) {
-      const tmp = h.xof(2); // 6:     t ← SHAKE-256-Extract(ctx, 16)
-      let w = (tmp[0] << 8) | tmp[1];
-      if (w < kQ) c[i++] = w % Q; // 8:         cᵢ ← t mod q
-    }
-    return c as TRet<IPoly>;
-  }
+  const HashToPoint: (nonce: Uint8Array, msg: Uint8Array) => Uint16Array =
+    opts.hashToPoint ?? function HashToPoint(nonce: TArg<Uint8Array>, msg: TArg<Uint8Array>): TRet<IPoly> {
+      // Algorithm 3: HashToPoint(str, q, n)
+      // (Page 31)
+      // Require: A string str, a modulus q ≤ 2¹⁶, a degree n ∈ N*
+      // Ensure: An polynomial c = Σᵢ cᵢxⁱ in Zq[x]
+      // 1: k ← ⌈2¹⁶/q⌉
+      // 2: ctx ← SHAKE-256-Init()
+      // 3: SHAKE-256-Inject(ctx, str)
+      // 4: i ← 0
+      // 5: while i < n do
+      // 6:     t ← SHAKE-256-Extract(ctx, 16)
+      // 7:     if t < kq then
+      // 8:         cᵢ ← t mod q
+      // 9:         i ← i + 1
+      // 10: return c
+      const h = shake256.create().update(nonce).update(msg); // 3: SHAKE-256-Inject(ctx, str)
+      const c = new Uint16Array(N);
+      // Round-3 Falcon keeps 16-bit draws only in 0..61444, i.e. below 61445 = 5*q, the largest
+      // 16-bit multiple of q below 2^16; a literal ceil(2^16/q)*q would accept every sample.
+      const kQ = 5 * Q;
+      for (let i = 0; i < N; ) {
+        const tmp = h.xof(2); // 6:     t ← SHAKE-256-Extract(ctx, 16)
+        let w = (tmp[0] << 8) | tmp[1];
+        if (w < kQ) c[i++] = w % Q; // 8:         cᵢ ← t mod q
+      }
+      return c as TRet<IPoly>;
+    };
   // This is basically one sampling routine,
   // but it carries a lot of internal state and gets complex quickly.
   class FFSampler {
@@ -2410,6 +2413,7 @@ const falcon512opts = {
   // Payload-only budget: genFalcon() adds the detached header byte and 40-byte nonce around it.
   detachedLen: 690,
 };
+export { genFalcon };
 /**
  * Falcon-512 detached-signature API with the attached helper exposed as `.attached`.
  * @example
@@ -2423,6 +2427,7 @@ const falcon512opts = {
  */
 export const falcon512: TRet<Falcon> = /* @__PURE__ */ (() =>
   genFalcon({ ...falcon512opts, maxS2Len: 711 }))();
+export const falcon512paddedOpts: FalconOpts = { ...falcon512opts, padded: true, maxS2Len: 625 };
 /**
  * Falcon-512 padded detached-signature API with the attached helper exposed as `.attached`.
  * @example

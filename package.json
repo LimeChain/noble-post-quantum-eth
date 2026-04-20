@@ -24,6 +24,7 @@
   "scripts": {
     "bench": "node test/benchmark.ts",
     "build": "tsc",
+    "prepare": "tsc",
     "build:release": "npx --no @paulmillr/jsbt esbuild test/build",
     "check": "npm run check:readme && npm run check:treeshake && npm run check:jsdoc",
     "check:readme": "npx --no @paulmillr/jsbt readme package.json",
