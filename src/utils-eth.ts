@@ -253,7 +253,7 @@ export function encodeFalconPublicKey(rawPublicKey: Uint8Array): Uint8Array {
   if (rawPublicKey[0] !== FALCON_PK_HEADER_BYTE) {
     throw new Error(
       `Falcon-512 public key: expected header byte 0x${FALCON_PK_HEADER_BYTE.toString(16)}, ` +
-        `got 0x${rawPublicKey[0].toString(16)}`,
+      `got 0x${rawPublicKey[0].toString(16)}`,
     );
   }
   const h = decodeFalconPublicKey14Bit(rawPublicKey.subarray(1));
@@ -285,7 +285,7 @@ export function encodeFalconSignature(nobleSig: Uint8Array): Uint8Array {
   if (nobleSig[0] !== FALCON_SIG_HEADER_BYTE) {
     throw new Error(
       `Falcon-512 signature: expected header byte 0x${FALCON_SIG_HEADER_BYTE.toString(16)}, ` +
-        `got 0x${nobleSig[0].toString(16)}`,
+      `got 0x${nobleSig[0].toString(16)}`,
     );
   }
   const salt = nobleSig.subarray(1, 1 + FALCON_SALT_LEN);
@@ -399,19 +399,6 @@ export function hashToPointEVM(
 
     counter += 1n;
     extendedView.setBigUint64(FALCON_ETH_STATE_SIZE, counter, false);
-  }
-
-  // Defensive invariants — belt-and-braces for the KAT assertion layer.
-  if (output.length !== FALCON_N) {
-    throw new Error(
-      `hashToPointEVM: output length ${output.length} !== ${FALCON_N}`,
-    );
-  }
-  for (let k = 0; k < FALCON_N; k++) {
-    const coeff = output[k];
-    if (coeff >= FALCON_Q) {
-      throw new Error(`hashToPointEVM: coeff[${k}]=${coeff} >= q=${FALCON_Q}`);
-    }
   }
 
   return output;
