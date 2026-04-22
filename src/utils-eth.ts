@@ -1,23 +1,28 @@
 /**
  * Ethereum-chain helpers for @noble/post-quantum.
  *
- * Houses the ETH-variant HashToPoint primitive and ZKNox wire-format
- * encoders consumed by `falcon512paddedEth` (exported from `./falcon.ts`).
+ * Houses ETH-variant primitives and ZKNox wire-format encoders consumed by
+ * the ETH scheme instances (`falcon512paddedEth` in `./falcon.ts`,
+ * `ml_dsa44eth` in `./ml-dsa.ts`).
  *
  * Strict DAG: this module imports only from `@noble/*` and `./_crystals.ts` —
- * never from sibling scheme modules. Scheme modules (`./falcon.ts`, and
- * future `./ml-dsa.ts` ETH-variants) import FROM this module, not vice
- * versa. No cyclic imports.
+ * never from sibling scheme modules. Scheme modules (`./falcon.ts`,
+ * `./ml-dsa.ts`) import FROM this module, not vice versa. No cyclic imports.
  *
- * Designed to hold ETH-side helpers for multiple PQC schemes. Falcon-ETH
- * is the day-one resident; ML-DSA-ETH will join with its own scheme-prefixed
- * encoders and XOF-factory primitives in a follow-up extraction.
+ * Surface:
+ * - ABI encoders: `encodeFalconPublicKey`, `encodeFalconSignature`,
+ *   `encodeMlDsaPublicKey`.
+ * - Falcon-ETH primitive: `hashToPointEVM` (Keccak-256 counter mode).
+ * - XOF abstractions: `XofFactory`, `XofReader`, and the three factory
+ *   adapters `shake128XofFactory`, `shake256XofFactory`, `keccakXofFactory`.
+ * - Keccak-PRG primitive: `createKeccakPrg`, `KeccakPrg`, `PrgLifecycleError`,
+ *   `PrgLifecycleCode` — byte-compatible with ZKNox's `Keccak256PRNG`.
  *
  * @module utils-eth
  */
 /*! noble-post-quantum - MIT License (c) 2024 Paul Miller (paulmillr.com) */
 import { invert } from '@noble/curves/abstract/modular.js';
-import { keccak_256 } from '@noble/hashes/sha3.js';
+import { keccak_256, shake128, shake256 } from '@noble/hashes/sha3.js';
 
 import { genCrystals } from './_crystals.ts';
 
@@ -90,6 +95,423 @@ function compactPoly256(coeffs: ArrayLike<number | bigint>, m: number): bigint[]
     b[idx] = (b[idx] as bigint) | ((a[i] as bigint) << shift);
   }
   return b;
+}
+
+/**
+ * Apply {@link compactPoly256} to every polynomial in a 2-D container.
+ * Used by the ML-DSA public-key encoder to compact both the `A_hat` matrix
+ * (K × L polys) and the transformed `t1` vector (1 × K polys, pre-transposed
+ * by the caller into a single-row module) into 32-bit-per-coefficient
+ * bigint words for the ZKNox on-chain verifier.
+ */
+function compactModule256(
+  data: ArrayLike<ArrayLike<number | bigint>>[],
+  m: number
+): bigint[][][] {
+  const res: bigint[][][] = [];
+  for (const row of data) {
+    const inner: bigint[][] = [];
+    for (let j = 0; j < row.length; j++) {
+      const poly = row[j];
+      if (poly === undefined) throw new Error(`compactModule256: undefined row at ${j}`);
+      inner.push(compactPoly256(poly, m));
+    }
+    res.push(inner);
+  }
+  return res;
+}
+
+/**
+ * Produce the byte layout Solidity emits for top-level `abi.encode(uint256[][])`:
+ *   offset(32) ‖ length(32) ‖ [rowOffset]* ‖ [rowTail]*
+ * where each `rowTail = length(32) ‖ [32B-BE word]*`. Row offsets are
+ * relative to the start of the head (after this encoding's own length word).
+ */
+function encodeUint256MatrixAbi(data: bigint[][]): Uint8Array {
+  const rows = data.length;
+  const rowTails: Uint8Array[] = [];
+  for (const row of data) {
+    const t = new Uint8Array(32 + row.length * 32);
+    const tView = new DataView(t.buffer, t.byteOffset, t.byteLength);
+    tView.setBigUint64(24, BigInt(row.length), false);
+    packBigEndianWords(row, t, 32);
+    rowTails.push(t);
+  }
+  const headSize = rows * 32;
+  const offsets: bigint[] = [];
+  let acc = BigInt(headSize);
+  for (const t of rowTails) {
+    offsets.push(acc);
+    acc += BigInt(t.length);
+  }
+  let tailSize = 0;
+  for (const t of rowTails) tailSize += t.length;
+  const out = new Uint8Array(32 + 32 + headSize + tailSize);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  out[31] = 0x20; // top-level offset word
+  view.setBigUint64(32 + 24, BigInt(rows), false); // length
+  for (let i = 0; i < rows; i++) {
+    view.setBigUint64(32 + 32 + i * 32 + 24, offsets[i] as bigint, false);
+  }
+  let pos = 32 + 32 + headSize;
+  for (const t of rowTails) {
+    out.set(t, pos);
+    pos += t.length;
+  }
+  return out;
+}
+
+/**
+ * Produce the byte layout Solidity emits for top-level
+ * `abi.encode(uint256[][][])`:
+ *   offset(32) ‖ length(32) ‖ [matrixOffset]* ‖ [matrixTail]*
+ * where each `matrixTail` is the inner `uint256[][]` encoding (no top-level
+ * offset prefix). Matrix offsets are relative to the start of the head.
+ */
+function encodeUint256Module3Abi(data: bigint[][][]): Uint8Array {
+  const matrices = data.length;
+  const matrixTails: Uint8Array[] = [];
+  for (const mat of data) {
+    // Inner (no top-level offset): length(32) ‖ [rowOffset]* ‖ [rowTail]*
+    const rows = mat.length;
+    const rowTails: Uint8Array[] = [];
+    for (const row of mat) {
+      const t = new Uint8Array(32 + row.length * 32);
+      const tView = new DataView(t.buffer, t.byteOffset, t.byteLength);
+      tView.setBigUint64(24, BigInt(row.length), false);
+      packBigEndianWords(row, t, 32);
+      rowTails.push(t);
+    }
+    const innerHeadSize = rows * 32;
+    const innerOffsets: bigint[] = [];
+    let iacc = BigInt(innerHeadSize);
+    for (const t of rowTails) {
+      innerOffsets.push(iacc);
+      iacc += BigInt(t.length);
+    }
+    let innerTailSize = 0;
+    for (const t of rowTails) innerTailSize += t.length;
+    const innerLen = 32 + innerHeadSize + innerTailSize;
+    const inner = new Uint8Array(innerLen);
+    const innerView = new DataView(inner.buffer, inner.byteOffset, inner.byteLength);
+    innerView.setBigUint64(24, BigInt(rows), false);
+    for (let i = 0; i < rows; i++) {
+      innerView.setBigUint64(32 + i * 32 + 24, innerOffsets[i] as bigint, false);
+    }
+    let ipos = 32 + innerHeadSize;
+    for (const t of rowTails) {
+      inner.set(t, ipos);
+      ipos += t.length;
+    }
+    matrixTails.push(inner);
+  }
+  const headSize = matrices * 32;
+  const offsets: bigint[] = [];
+  let acc = BigInt(headSize);
+  for (const t of matrixTails) {
+    offsets.push(acc);
+    acc += BigInt(t.length);
+  }
+  let tailSize = 0;
+  for (const t of matrixTails) tailSize += t.length;
+  const out = new Uint8Array(32 + 32 + headSize + tailSize);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  out[31] = 0x20;
+  view.setBigUint64(32 + 24, BigInt(matrices), false);
+  for (let i = 0; i < matrices; i++) {
+    view.setBigUint64(32 + 32 + i * 32 + 24, offsets[i] as bigint, false);
+  }
+  let pos = 32 + 32 + headSize;
+  for (const t of matrixTails) {
+    out.set(t, pos);
+    pos += t.length;
+  }
+  return out;
+}
+
+/**
+ * Produce the byte layout Solidity emits for top-level
+ * `abi.encode(bytes, bytes, bytes)`:
+ *   [offset0 offset1 offset2] ‖ [tail0 tail1 tail2]
+ * where each tail is `length(32) ‖ data ‖ zero-padding-to-32B-multiple`.
+ * The head is 3 × 32 bytes; offsets are relative to the start of the head.
+ */
+function encodeThreeBytesTupleAbi(
+  a: Uint8Array,
+  b: Uint8Array,
+  c: Uint8Array
+): Uint8Array {
+  const pad = (data: Uint8Array): Uint8Array => {
+    const paddedLen = Math.ceil(data.length / 32) * 32;
+    const t = new Uint8Array(32 + paddedLen);
+    const view = new DataView(t.buffer, t.byteOffset, t.byteLength);
+    view.setBigUint64(24, BigInt(data.length), false);
+    t.set(data, 32);
+    return t;
+  };
+  const parts = [pad(a), pad(b), pad(c)];
+  const headSize = 96;
+  const offsets = [
+    BigInt(headSize),
+    BigInt(headSize + parts[0]!.length),
+    BigInt(headSize + parts[0]!.length + parts[1]!.length),
+  ];
+  const total = headSize + parts[0]!.length + parts[1]!.length + parts[2]!.length;
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  for (let i = 0; i < 3; i++) {
+    view.setBigUint64(i * 32 + 24, offsets[i] as bigint, false);
+  }
+  let pos = headSize;
+  for (const p of parts) {
+    out.set(p, pos);
+    pos += p.length;
+  }
+  return out;
+}
+
+// ===== XOF abstractions =================================================
+
+/**
+ * Stateful XOF reader produced by an {@link XofFactory}. Each `xof(length)`
+ * call returns the next `length` bytes of the seeded stream; callers invoke
+ * it repeatedly against a single reader (e.g. the ML-DSA ExpandA
+ * rejection-sampling loop pulls multi-block chunks until 256 valid
+ * coefficients accumulate).
+ *
+ * `id` is a named discriminant: shared test helpers such as
+ * `assertBytesEqual` interpolate `(factory=<id>)` into divergence messages
+ * so interleaved-factory regressions have a grep-friendly anchor.
+ */
+export interface XofReader {
+  readonly id: 'shake128' | 'shake256' | 'keccak-prg';
+  xof(length: number): Uint8Array;
+}
+
+/**
+ * Constructs a fresh {@link XofReader} over `seed`. Every call MUST return
+ * an independent reader — no cached state crosses invocations. This is the
+ * parameterize-by-factory contract that supersedes module-level stateful
+ * XOF instances; the ML-DSA-ETH fork at the bottom of `./ml-dsa.ts`
+ * constructs fresh readers per sampler call.
+ */
+export type XofFactory = (seed: Uint8Array) => XofReader;
+
+/** NIST ExpandA-role adapter: wraps `@noble/hashes/sha3#shake128`. */
+export const shake128XofFactory: XofFactory = (seed) => {
+  const h = shake128.create({}).update(seed);
+  return {
+    id: 'shake128',
+    xof(length: number): Uint8Array {
+      const buf = new Uint8Array(length);
+      h.xofInto(buf);
+      return buf;
+    },
+  };
+};
+
+/** NIST H/tr-role adapter: wraps `@noble/hashes/sha3#shake256`. */
+export const shake256XofFactory: XofFactory = (seed) => {
+  const h = shake256.create({}).update(seed);
+  return {
+    id: 'shake256',
+    xof(length: number): Uint8Array {
+      const buf = new Uint8Array(length);
+      h.xofInto(buf);
+      return buf;
+    },
+  };
+};
+
+/**
+ * ETH single-XOF adapter: wraps {@link createKeccakPrg}. Collapses the
+ * SHAKE-128 / SHAKE-256 split of the NIST path onto one Keccak-PRG
+ * primitive — ETH callers populate both `xofFactory` and `xofFactory2`
+ * parameters (e.g. of {@link encodeMlDsaPublicKey}) with this adapter.
+ */
+export const keccakXofFactory: XofFactory = (seed) => {
+  const p = createKeccakPrg(seed);
+  p.flip();
+  return {
+    id: 'keccak-prg',
+    xof(length: number): Uint8Array {
+      return p.extract(length);
+    },
+  };
+};
+
+// ===== Keccak-PRG primitive =============================================
+
+/** Maximum cumulative inject size. Matches ZKNox Python ref. */
+const KECCAK_PRG_MAX_BUFFER_SIZE = 4096;
+
+/** Keccak-256 output size (bytes). */
+const KECCAK_OUTPUT = 32;
+
+/** Discriminant codes for {@link PrgLifecycleError}. Tests assert on `code`. */
+export type PrgLifecycleCode =
+  | 'PRG_INJECT_AFTER_FLIP'
+  | 'PRG_EXTRACT_BEFORE_FLIP'
+  | 'PRG_DOUBLE_FLIP'
+  | 'PRG_BUFFER_OVERFLOW';
+
+/**
+ * Structured error thrown when the PRG state machine is driven out of
+ * sequence or the inject buffer would overflow. Consumers discriminate
+ * on `code` (never message text).
+ */
+export class PrgLifecycleError extends Error {
+  readonly code: PrgLifecycleCode;
+
+  constructor(message: string, code: PrgLifecycleCode, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'PrgLifecycleError';
+    this.code = code;
+  }
+}
+
+/**
+ * Keccak-PRG primitive surface. Instances are stateful — construct a
+ * fresh one per caller. Never share instances across unrelated call
+ * sites.
+ */
+export interface KeccakPrg {
+  /** Absorb `data` into the buffer. Throws after `flip()`. */
+  inject(data: Uint8Array): void;
+  /** Finalize the state. One-shot — throws if called twice. */
+  flip(): void;
+  /** Stream `length` pseudorandom bytes. Throws before `flip()`. */
+  extract(length: number): Uint8Array;
+  /** SHAKE-parity alias for `inject`. */
+  update(data: Uint8Array): void;
+  /** SHAKE-parity alias for `extract`. */
+  read(length: number): Uint8Array;
+}
+
+/**
+ * Construct a fresh Keccak-PRG instance. Byte-compatible with ZKNox's
+ * `Keccak256PRNG(a=None, b=None)` wrapper at
+ * `ETHDILITHIUM/pythonref/dilithium_py/keccak_prng/keccak_prng_wrapper.py`.
+ *
+ * Three-phase one-way state machine:
+ *   1. Absorb  — `inject(data)` appends to a 4096-byte internal buffer.
+ *                Multiple calls concatenate. Disallowed after `flip()`.
+ *   2. Flip    — `flip()` finalizes: `state = keccak256(buffer[:bufferLen])`.
+ *                One-shot.
+ *   3. Extract — `extract(n)` streams pseudorandom bytes by iterating
+ *                `out_buffer = keccak256(state ‖ u64_be(counter))` and
+ *                copying at most 32 bytes per iteration; partial blocks
+ *                persist in `outBuffer[outBufferPos : outBufferLen]` so
+ *                that `extract(5) + extract(27)` on one instance matches
+ *                `extract(32)` on a freshly-seeded instance.
+ *
+ * Optional `seed` is equivalent to `const p = createKeccakPrg(); p.inject(seed);`
+ * — it does NOT auto-flip. The caller must call `flip()` before any
+ * `extract()`.
+ */
+export function createKeccakPrg(seed?: Uint8Array): KeccakPrg {
+  const buffer = new Uint8Array(KECCAK_PRG_MAX_BUFFER_SIZE);
+  let bufferLen = 0;
+  let finalized = false;
+  let state = new Uint8Array(KECCAK_OUTPUT);
+
+  // Streaming output state.
+  let outBuffer = new Uint8Array(KECCAK_OUTPUT);
+  let outBufferPos = 0;
+  let outBufferLen = 0;
+
+  // bigint u64 counter — packed big-endian via DataView.setBigUint64 during
+  // extract. Matches Python's arbitrary-precision int and Solidity's
+  // `shl(192, counter)` MSB placement.
+  let counter = 0n;
+
+  // Scratch block for the extract hash: state(32) ‖ u64_be(counter)(8).
+  const block = new Uint8Array(KECCAK_OUTPUT + 8);
+  const blockView = new DataView(block.buffer);
+
+  function inject(data: Uint8Array): void {
+    if (finalized) {
+      throw new PrgLifecycleError('Cannot inject after flip', 'PRG_INJECT_AFTER_FLIP');
+    }
+    if (bufferLen + data.length > KECCAK_PRG_MAX_BUFFER_SIZE) {
+      throw new PrgLifecycleError(
+        `Buffer overflow: ${bufferLen + data.length} > ${KECCAK_PRG_MAX_BUFFER_SIZE}`,
+        'PRG_BUFFER_OVERFLOW'
+      );
+    }
+    buffer.set(data, bufferLen);
+    bufferLen += data.length;
+  }
+
+  function flip(): void {
+    if (finalized) {
+      throw new PrgLifecycleError('Already finalized', 'PRG_DOUBLE_FLIP');
+    }
+    // Single-shot hash of absorbed buffer. Empty-seed path: buffer[:0]
+    // is the empty byte-string; keccak256(empty) is defined.
+    state = keccak_256(buffer.subarray(0, bufferLen));
+    finalized = true;
+    outBufferPos = 0;
+    outBufferLen = 0;
+  }
+
+  function extract(length: number): Uint8Array {
+    if (!finalized) {
+      throw new PrgLifecycleError(
+        'PRG not finalized; call flip() before extract()',
+        'PRG_EXTRACT_BEFORE_FLIP'
+      );
+    }
+
+    const output = new Uint8Array(length);
+    let offset = 0;
+
+    // (1) Drain any leftover bytes from the previous extract call. This is
+    //     load-bearing: extract(5) then extract(27) must NOT advance the
+    //     counter — they read bytes [0..5) and [5..32) of the same block.
+    if (outBufferLen > outBufferPos) {
+      const available = outBufferLen - outBufferPos;
+      const toCopy = Math.min(length, available);
+      output.set(outBuffer.subarray(outBufferPos, outBufferPos + toCopy), 0);
+      outBufferPos += toCopy;
+      offset += toCopy;
+      if (offset === length) return output;
+    }
+
+    // (2) Generate fresh blocks until the request is satisfied. Counter
+    //     packed big-endian as u64 into bytes [32..40) of the block.
+    while (offset < length) {
+      block.set(state, 0);
+      blockView.setBigUint64(KECCAK_OUTPUT, counter, false); // false = big-endian
+      outBuffer = keccak_256(block);
+      outBufferLen = KECCAK_OUTPUT;
+      outBufferPos = 0;
+
+      const remaining = length - offset;
+      const toCopy = Math.min(remaining, KECCAK_OUTPUT);
+      output.set(outBuffer.subarray(0, toCopy), offset);
+      outBufferPos = toCopy;
+      offset += toCopy;
+
+      counter += 1n;
+    }
+
+    return output;
+  }
+
+  function update(data: Uint8Array): void {
+    inject(data);
+  }
+  function read(length: number): Uint8Array {
+    return extract(length);
+  }
+
+  // Optional ctor seed ≡ immediate inject.
+  if (seed !== undefined && seed.length > 0) {
+    inject(seed);
+  }
+
+  return { inject, flip, extract, update, read };
 }
 
 // ===== Falcon-512 shared constants (NIST + ETH variants) ===============
@@ -387,4 +809,204 @@ export function hashToPointEVM(salt: Uint8Array, msg: Uint8Array): Uint16Array {
   }
 
   return output;
+}
+
+// ===== ML-DSA (shared NIST + ETH encoding) ==============================
+
+// ML-DSA-44 (FIPS 204 Level 2) constants. ZKNox's `ZKNOX_dilithium` hard-codes
+// `k = l = 4` at `ETHDILITHIUM/src/ZKNOX_dilithium_utils.sol:44-45`; no other
+// parameter set has an on-chain verifier in the repo's scope.
+const MLDSA_N = 256;
+const MLDSA_Q = 8380417;
+const MLDSA_K = 4;
+const MLDSA_L = 4;
+const MLDSA_D = 13; // FIPS 204 Table 1: dropped low bits in Power2Round
+const MLDSA_RHO_BYTES = 32;
+const MLDSA_T1_POLY_BYTES = 320; // 256 coeffs × 10 bits = 2560 bits → 320 B
+const MLDSA_TR_BYTES = 64;
+const MLDSA_PUBLIC_KEY_BYTES = MLDSA_RHO_BYTES + MLDSA_K * MLDSA_T1_POLY_BYTES; // 1312
+const MLDSA_COMPACT_BITS = 32;
+const MLDSA_F_INV = 8347681; // 256^-1 mod Q
+
+// Independent crystals context for the public-key encoder's `transformT1Poly`
+// forward-NTT. The fork's sibling `./ml-dsa.ts` has its OWN crystals
+// instance; duplicating it here keeps this module's DAG invariant (leaf,
+// imports only from `./_crystals.ts`). Both contexts use identical
+// parameters (N=256, Q=8380417, F=8347681, ROOT=1753, Int32Array polys,
+// brvBits=8) so their NTT outputs are byte-equal.
+const mldsaCrystals = genCrystals({
+  N: MLDSA_N,
+  Q: MLDSA_Q,
+  F: MLDSA_F_INV,
+  ROOT_OF_UNITY: 1753,
+  newPoly: (n: number) => new Int32Array(n),
+  isKyber: false,
+  brvBits: 8,
+});
+
+/** Decoded public-key components returned by {@link decodeMlDsaPublicKey}. */
+interface DecodedMlDsaPublicKey {
+  rho: Uint8Array;
+  t1: number[][];
+  tr: Uint8Array;
+}
+
+/**
+ * Rejection-sample one 256-coefficient polynomial for ExpandA from the XOF
+ * stream. Each accepted coefficient is a 23-bit integer < Q. Matches
+ * noble's `RejNTTPoly` inner loop (ml-dsa.ts:199) — only the byte source
+ * differs (flat-sequential `XofReader` here vs `XOF128.get(x,y)()` in noble).
+ */
+function mldsaRejectionSamplePoly(reader: XofReader): number[] {
+  const r = new Array<number>(MLDSA_N).fill(0);
+  let idx = 0;
+  while (idx < MLDSA_N) {
+    const buf = reader.xof(3 * 64);
+    for (let k = 0; idx < MLDSA_N && k <= buf.length - 3; k += 3) {
+      const b0 = buf[k];
+      const b1 = buf[k + 1];
+      const b2 = buf[k + 2];
+      if (b0 === undefined || b1 === undefined || b2 === undefined) break;
+      let t = b0 | (b1 << 8) | (b2 << 16);
+      t &= 0x7fffff;
+      if (t < MLDSA_Q) r[idx++] = t;
+    }
+  }
+  return r;
+}
+
+/**
+ * Rebuild the K×L `A_hat` matrix from `rho` by re-running ExpandA. Each
+ * `A_hat[i][j]` is sampled from a fresh XOF over `rho ‖ u8(j) ‖ u8(i)`,
+ * mirroring FIPS 204 Algorithm 32 (`rho ‖ IntegerToBytes(j, 1) ‖
+ * IntegerToBytes(i, 1)`).
+ */
+function recoverMlDsaAhat(
+  rho: Uint8Array,
+  k: number,
+  l: number,
+  xofFactoryExpandA: XofFactory
+): number[][][] {
+  const aHat: number[][][] = [];
+  for (let i = 0; i < k; i++) {
+    const row: number[][] = [];
+    for (let j = 0; j < l; j++) {
+      const seed = new Uint8Array(rho.length + 2);
+      seed.set(rho, 0);
+      seed[rho.length] = j;
+      seed[rho.length + 1] = i;
+      row.push(mldsaRejectionSamplePoly(xofFactoryExpandA(seed)));
+    }
+    aHat.push(row);
+  }
+  return aHat;
+}
+
+/**
+ * Unpack 320 bytes of 10-bit-packed `t1` coefficients into a length-256
+ * polynomial (T1Coder.decode, port of noble's `polyCoder(10)`). Uses a
+ * bigint accumulator so the 2560-bit chunk can be indexed with a single
+ * mask per coefficient without worrying about JS number precision.
+ */
+function mldsaPolyDecode10Bits(bytes: Uint8Array): number[] {
+  const poly = new Array<number>(MLDSA_N).fill(0);
+  let r = 0n;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === undefined) break;
+    r |= BigInt(b) << BigInt(8 * i);
+  }
+  const mask = (1n << 10n) - 1n;
+  for (let i = 0; i < MLDSA_N; i++) {
+    poly[i] = Number((r >> BigInt(i * 10)) & mask);
+  }
+  return poly;
+}
+
+/**
+ * Parse a raw 1312-byte ML-DSA-44 NIST public key into `(rho, t1, tr)`.
+ * `tr` is computed as `xofFactoryH(pk).xof(64)` — SHAKE-256 on the NIST
+ * path, Keccak-PRG on the ETH path.
+ */
+function decodeMlDsaPublicKey(
+  publicKey: Uint8Array,
+  xofFactoryH: XofFactory
+): DecodedMlDsaPublicKey {
+  if (publicKey.length !== MLDSA_PUBLIC_KEY_BYTES) {
+    throw new Error(
+      `ML-DSA-44 public key: expected ${MLDSA_PUBLIC_KEY_BYTES} bytes, got ${publicKey.length}`
+    );
+  }
+  const rho = publicKey.slice(0, MLDSA_RHO_BYTES);
+  const t1: number[][] = [];
+  for (let i = 0; i < MLDSA_K; i++) {
+    const offset = MLDSA_RHO_BYTES + i * MLDSA_T1_POLY_BYTES;
+    t1.push(mldsaPolyDecode10Bits(publicKey.slice(offset, offset + MLDSA_T1_POLY_BYTES)));
+  }
+  const tr = xofFactoryH(new Uint8Array(publicKey)).xof(MLDSA_TR_BYTES);
+  return { rho, t1, tr };
+}
+
+/**
+ * Apply the FIPS 204 verifier transform to one `t1` polynomial: shift each
+ * coefficient by `2^d` (Power2Round high-bit lift) then forward NTT,
+ * leaving coefficients mod Q. ZKNox's `ZKNOX_dilithium_core.sol#dilithiumCore2`
+ * uses these pre-computed values directly when fusing `A*z - c*t1`
+ * (ETHDILITHIUM line 199), and the on-chain test vectors at
+ * `ETHDILITHIUM/test/dilithium.t.sol:543+` confirm storage in this
+ * transformed form (values up to ~2^23 ≫ 2^10).
+ */
+function mldsaTransformT1Poly(poly: number[]): number[] {
+  const buf = new Int32Array(MLDSA_N);
+  for (let i = 0; i < MLDSA_N; i++) {
+    const v = poly[i];
+    if (v === undefined) throw new Error(`mldsaTransformT1Poly: undefined at ${i}`);
+    buf[i] = v << MLDSA_D;
+  }
+  mldsaCrystals.NTT.encode(buf);
+  const out = new Array<number>(MLDSA_N);
+  for (let i = 0; i < MLDSA_N; i++) {
+    const v = (buf[i] as number) % MLDSA_Q;
+    out[i] = v >= 0 ? v : v + MLDSA_Q;
+  }
+  return out;
+}
+
+/**
+ * Transform a raw 1312-byte ML-DSA-44 NIST public key into the ABI-encoded
+ * `(bytes aHatEncoded, bytes tr, bytes t1Encoded)` payload that
+ * `ZKNOX_dilithium.setKey()` writes via SSTORE2 and `_readPubKey` decodes
+ * (`ETHDILITHIUM/src/ZKNOX_dilithium.sol:91-97`).
+ *
+ * Two-factory signature — matches the Python reference
+ * `_keygen_internal(_xof=shake256, _xof2=shake128)` split:
+ *
+ * - `xofFactory`  ≡ Python `_xof`  — drives the `tr` H-of-pk computation
+ *   (SHAKE-256 on the NIST path; Keccak-PRG on the ETH path).
+ * - `xofFactory2` ≡ Python `_xof2` — drives ExpandA / rejection sampling
+ *   (SHAKE-128 on the NIST path; Keccak-PRG on the ETH path).
+ *
+ * NIST callers pass `(shake256XofFactory, shake128XofFactory)`. ETH callers
+ * pass `(keccakXofFactory, keccakXofFactory)` — same factory twice (the
+ * single-primitive collapse for the ETH path).
+ */
+export function encodeMlDsaPublicKey(
+  rawPublicKey: Uint8Array,
+  xofFactory: XofFactory,
+  xofFactory2: XofFactory
+): Uint8Array {
+  const { rho, t1, tr } = decodeMlDsaPublicKey(rawPublicKey, xofFactory);
+  const aHat = recoverMlDsaAhat(rho, MLDSA_K, MLDSA_L, xofFactory2);
+  const t1Transformed = t1.map(mldsaTransformT1Poly);
+
+  const aHatCompact = compactModule256(aHat, MLDSA_COMPACT_BITS);
+  const t1Transposed = [t1Transformed];
+  const t1Compact = compactModule256(t1Transposed, MLDSA_COMPACT_BITS)[0];
+  if (t1Compact === undefined) {
+    throw new Error('encodeMlDsaPublicKey: t1Compact undefined');
+  }
+
+  const aHatEncoded = encodeUint256Module3Abi(aHatCompact);
+  const t1Encoded = encodeUint256MatrixAbi(t1Compact);
+  return encodeThreeBytesTupleAbi(aHatEncoded, tr, t1Encoded);
 }

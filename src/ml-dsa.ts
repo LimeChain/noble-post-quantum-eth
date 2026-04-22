@@ -33,6 +33,7 @@ import {
   vecCoder,
   type VerOpts,
 } from './utils.ts';
+import { keccakXofFactory, type XofReader } from './utils-eth.ts';
 
 /** Internal ML-DSA options. */
 export type DSAInternalOpts = {
@@ -781,4 +782,548 @@ export const ml_dsa87: TRet<DSA> = /* @__PURE__ */ (() =>
     XOF128,
     XOF256,
     securityLevel: 256,
+  }))();
+
+// =============================================================================
+// ===== ETH variant (Keccak-PRG-driven Dilithium-2) ===========================
+// =============================================================================
+//
+// `ml_dsa44eth` is byte-compatible with ETHDILITHIUM's on-chain Dilithium-2
+// verifier: every SHAKE-128 / SHAKE-256 XOF role in FIPS 204 is replaced by
+// the Keccak-PRG primitive exported from `./utils-eth.ts`. This delivers
+// distinct byte-identity from `ml_dsa44` at every intermediate state —
+// identical seeds produce DIFFERENT keys across the two variants.
+//
+// The ETH-variant sampler loops live here (not in `./utils-eth.ts`) because
+// they need closure access to the module-scope ML-DSA arithmetic machinery
+// (`polyAdd`, `MultiplyNTTs`, `RejNTTPoly`, `polyCoder`, `crystals`,
+// `newPoly`, `N`, `Q`, `D`, plus the upstream coders `splitCoder` /
+// `vecCoder`). `utils-eth.ts` imports from `@noble/*` + `./_crystals.ts`
+// only, so hoisting the ETH body there would either duplicate all of the
+// above or introduce a cyclic import graph.
+//
+// Structurally this mirrors `./falcon.ts`, which hosts both NIST and ETH
+// Falcon variants in one file under the same convention.
+
+/** Parameter set for {@link getMlDsaEth} — identical shape to
+ * {@link DSAParam} plus the ETH-specific byte-length overrides. */
+type MlDsaEthOpts = {
+  /** Matrix row count — 4 for ML-DSA-44. */
+  K: number;
+  /** Matrix column count — 4 for ML-DSA-44. */
+  L: number;
+  /** Bit width used when rounding `t`. */
+  D: number;
+  /** Bound used for the `y` sampling range. */
+  GAMMA1: number;
+  /** Bound used during decomposition and hints. */
+  GAMMA2: number;
+  /** Number of non-zero challenge coefficients. */
+  TAU: number;
+  /** Centered-binomial noise parameter. */
+  ETA: number;
+  /** Maximum number of hint bits in a signature. */
+  OMEGA: number;
+  /** Commitment-hash length (µ / ρ′ width) — 64 for ML-DSA-44. */
+  CRH_BYTES: number;
+  /** Public-key digest length (`tr`) — 64 for ML-DSA-44. */
+  TR_BYTES: number;
+  /** Challenge-hash length (`c̃`) — 32 for ML-DSA-44. */
+  C_TILDE_BYTES: number;
+};
+
+/**
+ * Instantiate a Keccak-PRG-driven ML-DSA-44 parameter set. Returns a
+ * {@link DSA} instance with the same contract as `ml_dsa44` / `ml_dsa65` /
+ * `ml_dsa87` — `keygen` / `getPublicKey` / `sign` / `verify` / `internal` —
+ * backed by byte-identical behaviour against ETHDILITHIUM's Python
+ * reference `_keygen_internal` / `_sign_internal` / `_verify_internal`.
+ */
+function getMlDsaEth(opts_: TArg<MlDsaEthOpts>): TRet<DSA> {
+  const opts = opts_ as MlDsaEthOpts;
+  const { K, L, GAMMA1, GAMMA2, TAU, ETA, OMEGA } = opts;
+  const { CRH_BYTES, TR_BYTES, C_TILDE_BYTES } = opts;
+
+  if (![2, 4].includes(ETA)) throw new Error('Wrong ETA');
+  if (![1 << 17, 1 << 19].includes(GAMMA1)) throw new Error('Wrong GAMMA1');
+  if (![GAMMA2_1, GAMMA2_2].includes(GAMMA2)) throw new Error('Wrong GAMMA2');
+  const BETA = TAU * ETA;
+
+  // ===== Decompose / HighBits / LowBits / Hint (param-dependent) =========
+
+  const decompose = (r: number) => {
+    const rPlus = crystals.mod(r);
+    const r0 = crystals.smod(rPlus, 2 * GAMMA2) | 0;
+    if (rPlus - r0 === Q - 1) return { r1: 0 | 0, r0: (r0 - 1) | 0 };
+    const r1 = Math.floor((rPlus - r0) / (2 * GAMMA2)) | 0;
+    return { r1, r0 };
+  };
+  const HighBits = (r: number) => decompose(r).r1;
+  const LowBits = (r: number) => decompose(r).r0;
+  const MakeHint = (z: number, r: number) =>
+    z <= GAMMA2 || z > Q - GAMMA2 || (z === Q - GAMMA2 && r === 0) ? 0 : 1;
+  const UseHint = (h: number, r: number) => {
+    const m = Math.floor((Q - 1) / (2 * GAMMA2));
+    const { r1, r0 } = decompose(r);
+    if (h === 1) return r0 > 0 ? crystals.mod(r1 + 1, m) | 0 : crystals.mod(r1 - 1, m) | 0;
+    return r1 | 0;
+  };
+  const Power2Round = (r: number) => {
+    const rPlus = crystals.mod(r);
+    const r0 = crystals.smod(rPlus, 2 ** D) | 0;
+    return { r1: Math.floor((rPlus - r0) / 2 ** D) | 0, r0 };
+  };
+
+  // ===== Coders (ETA-dependent; param-set-dependent) =====================
+
+  const ETACoder = polyCoder(
+    ETA === 2 ? 3 : 4,
+    (i: number) => ETA - i,
+    (i: number) => {
+      if (!(-ETA <= i && i <= ETA))
+        throw new Error(`malformed key s1/s3 ${i} outside of ETA range [${-ETA}, ${ETA}]`);
+      return i;
+    }
+  );
+  const T0Coder = polyCoder(13, (i: number) => (1 << (D - 1)) - i);
+  const T1Coder = polyCoder(10);
+  const ZCoder = polyCoder(GAMMA1 === 1 << 17 ? 18 : 20, (i: number) => crystals.smod(GAMMA1 - i));
+  const W1Coder = polyCoder(GAMMA2 === GAMMA2_1 ? 6 : 4);
+  const W1Vec = vecCoder(W1Coder, K);
+
+  const publicCoder = splitCoder('publicKey', 32, vecCoder(T1Coder, K));
+  const secretCoder = splitCoder(
+    'secretKey',
+    32,
+    32,
+    TR_BYTES,
+    vecCoder(ETACoder, L),
+    vecCoder(ETACoder, K),
+    vecCoder(T0Coder, K)
+  );
+
+  // Signature hint coder — same encode/decode as noble's `getDilithium`
+  // hint coder (both sides retained because `internal.verify` consumes
+  // the decode path).
+  const hintCoder: BytesCoderLen<Poly[] | false> = {
+    bytesLen: OMEGA + K,
+    encode: (h_: TArg<Poly[] | false>): TRet<Uint8Array> => {
+      const h = h_ as Poly[] | false;
+      if (h === false) throw new Error('hint.encode: hint is false');
+      const res = new Uint8Array(OMEGA + K);
+      for (let i = 0, k = 0; i < K; i++) {
+        for (let j = 0; j < N; j++) if (h[i][j] !== 0) res[k++] = j;
+        res[OMEGA + i] = k;
+      }
+      return res as TRet<Uint8Array>;
+    },
+    decode: (buf: TArg<Uint8Array>): TRet<Poly[] | false> => {
+      const h: Poly[] = [];
+      let k = 0;
+      for (let i = 0; i < K; i++) {
+        const hi = newPoly(N);
+        if (buf[OMEGA + i] < k || buf[OMEGA + i] > OMEGA) return false as TRet<false>;
+        for (let j = k; j < buf[OMEGA + i]; j++) {
+          if (j > k && buf[j] <= buf[j - 1]) return false as TRet<false>;
+          hi[buf[j]] = 1;
+        }
+        k = buf[OMEGA + i];
+        h.push(hi);
+      }
+      for (let j = k; j < OMEGA; j++) if (buf[j] !== 0) return false as TRet<false>;
+      return h as TRet<Poly[]>;
+    },
+  };
+  const sigCoder = splitCoder('signature', C_TILDE_BYTES, vecCoder(ZCoder, L), hintCoder);
+  const seedCoder = splitCoder('seed', 32, 64, 32);
+
+  // ===== ETH-variant samplers (consume XofReader via XofGet closures) ====
+  //
+  // `makeXofGet` reproduces noble's `XOF.get(x, y)()` shape: each `(x, y)`
+  // pair yields a closure that emits successive fixed-size chunks. The
+  // underlying byte source is a fresh Keccak-PRG reader per `(x, y)` over
+  // `seed ‖ u8(x) ‖ u8(y)` — matches ETHDILITHIUM Python ref's per-call
+  // instantiation pattern.
+
+  function makeXofGet(
+    seed: Uint8Array,
+    blockLen: number
+  ): (x: number, y: number) => () => Uint8Array {
+    return (x: number, y: number): (() => Uint8Array) => {
+      const fullSeed = new Uint8Array(seed.length + 2);
+      fullSeed.set(seed, 0);
+      fullSeed[seed.length] = x;
+      fullSeed[seed.length + 1] = y;
+      const reader: XofReader = keccakXofFactory(fullSeed);
+      return () => reader.xof(blockLen);
+    };
+  }
+
+  // SHAKE-128 rate (168 B) for ExpandA — divisible by 3, matching
+  // `RejNTTPoly`'s 3-byte-triple rejection loop at module scope.
+  const EXPAND_A_BLOCK = 168;
+  // SHAKE-256 rate (136 B) for ExpandS — half-byte sampling, no %3 constraint.
+  const EXPAND_S_BLOCK = 136;
+
+  const CoefFromHalfByte =
+    ETA === 2
+      ? (n: number) => (n < 15 ? 2 - (n % 5) : false)
+      : (n: number) => (n < 9 ? 4 - n : false);
+
+  // ETH-variant ExpandS — same inner loop as noble's `RejBoundedPoly`
+  // (getDilithium closure); parameterized to consume the XofGet closure
+  // shape returned by `makeXofGet`.
+  function RejBoundedPolyEth(xof_: TArg<() => Uint8Array>): TRet<Poly> {
+    const xof = xof_ as () => Uint8Array;
+    const r: Poly = newPoly(N);
+    for (let j = 0; j < N; ) {
+      const b = xof();
+      for (let i = 0; j < N && i < b.length; i += 1) {
+        const d1 = CoefFromHalfByte(b[i] & 0x0f);
+        const d2 = CoefFromHalfByte((b[i] >> 4) & 0x0f);
+        if (d1 !== false) r[j++] = d1;
+        if (j < N && d2 !== false) r[j++] = d2;
+      }
+    }
+    return r as TRet<Poly>;
+  }
+
+  // ETH-variant SampleInBall — challenge XOF is Keccak-PRG (not SHAKE-256).
+  // The sign-byte prefix + rejection-sampling stream both consume bytes
+  // from one fresh PRG reader over `cTilde`.
+  const SampleInBallEth = (seed: TArg<Uint8Array>): TRet<Poly> => {
+    const pre = newPoly(N);
+    const reader = keccakXofFactory(seed as Uint8Array);
+    const BLOCK_LEN = 136; // SHAKE-256 rate preserved for byte-identity.
+    let buf = reader.xof(BLOCK_LEN);
+    const masks = buf.slice(0, 8);
+    for (let i = N - TAU, pos = 8, maskPos = 0, maskBit = 0; i < N; i++) {
+      let b = i + 1;
+      for (; b > i; ) {
+        b = buf[pos++];
+        if (pos < BLOCK_LEN) continue;
+        buf = reader.xof(BLOCK_LEN);
+        pos = 0;
+      }
+      pre[i] = pre[b];
+      pre[b] = 1 - (((masks[maskPos] >> maskBit++) & 1) << 1);
+      if (maskBit >= 8) {
+        maskPos++;
+        maskBit = 0;
+      }
+    }
+    return pre as TRet<Poly>;
+  };
+
+  const polyPowerRound = (p_: TArg<Poly>) => {
+    const p = p_ as Poly;
+    const res0 = newPoly(N);
+    const res1 = newPoly(N);
+    for (let i = 0; i < p.length; i++) {
+      const { r0, r1 } = Power2Round(p[i]);
+      res0[i] = r0;
+      res1[i] = r1;
+    }
+    return { r0: res0, r1: res1 };
+  };
+  const polyUseHint = (u_: TArg<Poly>, h_: TArg<Poly>): TRet<Poly> => {
+    const u = u_ as Poly;
+    const h = h_ as Poly;
+    for (let i = 0; i < N; i++) u[i] = UseHint(h[i], u[i]);
+    return u as TRet<Poly>;
+  };
+  const polyMakeHint = (a_: TArg<Poly>, b_: TArg<Poly>) => {
+    const a = a_ as Poly;
+    const b = b_ as Poly;
+    const v = newPoly(N);
+    let cnt = 0;
+    for (let i = 0; i < N; i++) {
+      const h = MakeHint(a[i], b[i]);
+      v[i] = h;
+      cnt += h;
+    }
+    return { v, cnt };
+  };
+
+  // ===== Internal implementation (DSA contract) ==========================
+
+  const signRandBytes = 32;
+
+  const internal: TRet<DSAInternal> = Object.freeze({
+    info: Object.freeze({ type: 'internal-ml-dsa-eth' }),
+    lengths: Object.freeze({
+      secretKey: secretCoder.bytesLen,
+      publicKey: publicCoder.bytesLen,
+      seed: 32,
+      signature: sigCoder.bytesLen,
+      signRand: signRandBytes,
+    }),
+    keygen: (seed?: TArg<Uint8Array>) => {
+      const randSeed = seed === undefined;
+      if (randSeed) seed = randomBytes(32);
+      abytes(seed!, 32, 'seed');
+      const seedDst = new Uint8Array(32 + 2);
+      seedDst.set(seed!);
+      if (randSeed) cleanBytes(seed!);
+      seedDst[32] = K;
+      seedDst[33] = L;
+      // Seed expansion — ETHDILITHIUM Python `_h(seed_domain_sep, 128, _xof=Keccak256PRNG)`.
+      const seedBytes = keccakXofFactory(seedDst).xof(seedCoder.bytesLen);
+      const [rho, rhoPrime, K_] = seedCoder.decode(seedBytes);
+
+      const xofPrime = makeXofGet(rhoPrime, EXPAND_S_BLOCK);
+      const s1: Poly[] = [];
+      for (let i = 0; i < L; i++)
+        s1.push(RejBoundedPolyEth(xofPrime(i & 0xff, (i >> 8) & 0xff)));
+      const s2: Poly[] = [];
+      for (let i = L; i < L + K; i++)
+        s2.push(RejBoundedPolyEth(xofPrime(i & 0xff, (i >> 8) & 0xff)));
+      const s1Hat = s1.map((p) => crystals.NTT.encode(p.slice()));
+
+      const xof = makeXofGet(rho, EXPAND_A_BLOCK);
+      const t0: Poly[] = [];
+      const t1: Poly[] = [];
+      const t = newPoly(N);
+      for (let i = 0; i < K; i++) {
+        cleanBytes(t);
+        for (let j = 0; j < L; j++) {
+          // `RejNTTPoly` from module scope accepts any `() => Uint8Array`
+          // that emits `blockLen % 3 === 0` chunks — our 168 B
+          // `EXPAND_A_BLOCK` satisfies that invariant.
+          const aij = RejNTTPoly(xof(j, i));
+          polyAdd(t, MultiplyNTTs(aij, s1Hat[j]));
+        }
+        crystals.NTT.decode(t);
+        const { r0, r1 } = polyPowerRound(polyAdd(t, s2[i]));
+        t0.push(r0);
+        t1.push(r1);
+      }
+      const publicKey = publicCoder.encode([rho, t1]);
+      const tr = keccakXofFactory(publicKey).xof(TR_BYTES);
+      const secretKey = secretCoder.encode([rho, K_, tr, s1, s2, t0]);
+      cleanBytes(rho, rhoPrime, K_, s1, s2, s1Hat, t, t0, t1, tr, seedDst);
+      return {
+        publicKey: publicKey as TRet<Uint8Array>,
+        secretKey: secretKey as TRet<Uint8Array>,
+      };
+    },
+    getPublicKey: (secretKey: TArg<Uint8Array>): TRet<Uint8Array> => {
+      const [rho, _K, _tr, s1, s2, _t0] = secretCoder.decode(secretKey);
+      const xof = makeXofGet(rho, EXPAND_A_BLOCK);
+      const s1Hat = s1.map((p) => crystals.NTT.encode(p.slice()));
+      const t1: Poly[] = [];
+      const tmp = newPoly(N);
+      for (let i = 0; i < K; i++) {
+        tmp.fill(0);
+        for (let j = 0; j < L; j++) {
+          const aij = RejNTTPoly(xof(j, i));
+          polyAdd(tmp, MultiplyNTTs(aij, s1Hat[j]));
+        }
+        crystals.NTT.decode(tmp);
+        polyAdd(tmp, s2[i]);
+        const { r1 } = polyPowerRound(tmp);
+        t1.push(r1);
+      }
+      cleanBytes(tmp, s1Hat, _t0, s1, s2);
+      return publicCoder.encode([rho, t1]);
+    },
+    sign: (
+      msg: TArg<Uint8Array>,
+      secretKey: TArg<Uint8Array>,
+      opts: TArg<SigOpts & DSAInternalOpts> = {}
+    ): TRet<Uint8Array> => {
+      validateSigOpts(opts);
+      validateInternalOpts(opts);
+      let { extraEntropy: random, externalMu = false } = opts;
+      const [rho, _K, tr, s1, s2, t0] = secretCoder.decode(secretKey);
+      // Pre-cache A_hat (same as noble).
+      const A: Poly[][] = [];
+      const xofA = makeXofGet(rho, EXPAND_A_BLOCK);
+      for (let i = 0; i < K; i++) {
+        const pv = [];
+        for (let j = 0; j < L; j++) pv.push(RejNTTPoly(xofA(j, i)));
+        A.push(pv);
+      }
+      for (let i = 0; i < L; i++) crystals.NTT.encode(s1[i]);
+      for (let i = 0; i < K; i++) {
+        crystals.NTT.encode(s2[i]);
+        crystals.NTT.encode(t0[i]);
+      }
+
+      const mu = externalMu
+        ? (msg as Uint8Array)
+        : (() => {
+            // µ = H(tr ‖ M', 64) via Keccak-PRG.
+            const trM = new Uint8Array(tr.length + (msg as Uint8Array).length);
+            trM.set(tr, 0);
+            trM.set(msg as Uint8Array, tr.length);
+            return keccakXofFactory(trM).xof(CRH_BYTES);
+          })();
+
+      const rnd =
+        random === false
+          ? new Uint8Array(32)
+          : random === undefined
+            ? randomBytes(signRandBytes)
+            : random;
+      abytes(rnd, 32, 'extraEntropy');
+
+      const kRndMu = new Uint8Array(_K.length + rnd.length + mu.length);
+      kRndMu.set(_K, 0);
+      kRndMu.set(rnd, _K.length);
+      kRndMu.set(mu, _K.length + rnd.length);
+      const rhoprime = keccakXofFactory(kRndMu).xof(CRH_BYTES);
+
+      // Rejection loop.
+      main_loop: for (let kappa = 0; ; ) {
+        const y: Poly[] = [];
+        // ExpandMask: each y_i seeded by rhoprime ‖ u16_le(kappa).
+        for (let i = 0; i < L; i++, kappa++) {
+          const ySeed = new Uint8Array(rhoprime.length + 2);
+          ySeed.set(rhoprime, 0);
+          ySeed[rhoprime.length] = kappa & 0xff;
+          ySeed[rhoprime.length + 1] = (kappa >> 8) & 0xff;
+          y.push(ZCoder.decode(keccakXofFactory(ySeed).xof(ZCoder.bytesLen)));
+        }
+        const z = y.map((i) => crystals.NTT.encode(i.slice()));
+        const w: Poly[] = [];
+        for (let i = 0; i < K; i++) {
+          const wi = newPoly(N);
+          for (let j = 0; j < L; j++) polyAdd(wi, MultiplyNTTs(A[i][j], z[j]));
+          crystals.NTT.decode(wi);
+          w.push(wi);
+        }
+        const w1 = w.map((j) => j.map(HighBits));
+        // c̃ = Keccak-PRG(µ ‖ W1Encode(w1), 32).
+        const muW1 = new Uint8Array(mu.length + W1Vec.encode(w1).length);
+        muW1.set(mu, 0);
+        muW1.set(W1Vec.encode(w1), mu.length);
+        const cTilde = keccakXofFactory(muW1).xof(C_TILDE_BYTES);
+        const cHat = crystals.NTT.encode(SampleInBallEth(cTilde));
+        const cs1 = s1.map((i) => MultiplyNTTs(i, cHat));
+        for (let i = 0; i < L; i++) {
+          polyAdd(crystals.NTT.decode(cs1[i]), y[i]);
+          if (polyChknorm(cs1[i], GAMMA1 - BETA)) continue main_loop;
+        }
+        let cnt = 0;
+        const h: Poly[] = [];
+        for (let i = 0; i < K; i++) {
+          const cs2 = crystals.NTT.decode(MultiplyNTTs(s2[i], cHat));
+          const r0 = polySub(w[i], cs2).map(LowBits);
+          if (polyChknorm(r0, GAMMA2 - BETA)) continue main_loop;
+          const ct0 = crystals.NTT.decode(MultiplyNTTs(t0[i], cHat));
+          if (polyChknorm(ct0, GAMMA2)) continue main_loop;
+          polyAdd(r0, ct0);
+          const hint = polyMakeHint(r0, w1[i]);
+          h.push(hint.v);
+          cnt += hint.cnt;
+        }
+        if (cnt > OMEGA) continue;
+        const res = sigCoder.encode([cTilde, cs1, h]);
+        cleanBytes(cTilde, cs1, h, cHat, w1, w, z, y, rhoprime, s1, s2, t0, ...A);
+        if (!externalMu) cleanBytes(mu);
+        return res as TRet<Uint8Array>;
+      }
+      // @ts-ignore
+      throw new Error('Unreachable code path reached, report this error');
+    },
+    verify: (
+      sig: TArg<Uint8Array>,
+      msg: TArg<Uint8Array>,
+      publicKey: TArg<Uint8Array>,
+      opts: TArg<DSAInternalOpts> = {}
+    ) => {
+      validateInternalOpts(opts);
+      const { externalMu = false } = opts;
+      const [rho, t1] = publicCoder.decode(publicKey);
+      const tr = keccakXofFactory(publicKey as Uint8Array).xof(TR_BYTES);
+
+      if ((sig as Uint8Array).length !== sigCoder.bytesLen) return false;
+      const [cTilde, z, h] = sigCoder.decode(sig);
+      if (h === false) return false;
+      for (let i = 0; i < L; i++) if (polyChknorm(z[i], GAMMA1 - BETA)) return false;
+
+      const mu = externalMu
+        ? (msg as Uint8Array)
+        : (() => {
+            const trM = new Uint8Array(tr.length + (msg as Uint8Array).length);
+            trM.set(tr, 0);
+            trM.set(msg as Uint8Array, tr.length);
+            return keccakXofFactory(trM).xof(CRH_BYTES);
+          })();
+
+      const c = crystals.NTT.encode(SampleInBallEth(cTilde));
+      const zNtt = z.map((i) => i.slice());
+      for (let i = 0; i < L; i++) crystals.NTT.encode(zNtt[i]);
+      const wTick1: Poly[] = [];
+      const xof = makeXofGet(rho, EXPAND_A_BLOCK);
+      for (let i = 0; i < K; i++) {
+        const ct12d = MultiplyNTTs(crystals.NTT.encode(polyShiftl(t1[i])), c);
+        const Az = newPoly(N);
+        for (let j = 0; j < L; j++) {
+          const aij = RejNTTPoly(xof(j, i));
+          polyAdd(Az, MultiplyNTTs(aij, zNtt[j]));
+        }
+        const wApprox = crystals.NTT.decode(polySub(Az, ct12d));
+        wTick1.push(polyUseHint(wApprox, h[i]));
+      }
+      // c̃′ = Keccak-PRG(µ ‖ W1Encode(w′1), 32).
+      const muW1 = new Uint8Array(mu.length + W1Vec.encode(wTick1).length);
+      muW1.set(mu, 0);
+      muW1.set(W1Vec.encode(wTick1), mu.length);
+      const c2 = keccakXofFactory(muW1).xof(C_TILDE_BYTES);
+
+      for (const t of h) {
+        const sum = t.reduce((acc, i) => acc + i, 0);
+        if (!(sum <= OMEGA)) return false;
+      }
+      for (const t of z) if (polyChknorm(t, GAMMA1 - BETA)) return false;
+      return equalBytes(cTilde, c2);
+    },
+  });
+
+  return Object.freeze({
+    info: Object.freeze({ type: 'ml-dsa-eth' }),
+    internal,
+    lengths: internal.lengths,
+    keygen: internal.keygen,
+    getPublicKey: internal.getPublicKey,
+    sign: (
+      msg: TArg<Uint8Array>,
+      secretKey: TArg<Uint8Array>,
+      opts: TArg<SigOpts> = {}
+    ): TRet<Uint8Array> => {
+      validateSigOpts(opts);
+      const M = getMessage(msg, opts.context);
+      const res = internal.sign(M, secretKey, opts);
+      cleanBytes(M);
+      return res as TRet<Uint8Array>;
+    },
+    verify: (
+      sig: TArg<Uint8Array>,
+      msg: TArg<Uint8Array>,
+      publicKey: TArg<Uint8Array>,
+      opts: TArg<VerOpts> = {}
+    ) => {
+      validateVerOpts(opts);
+      return internal.verify(sig, getMessage(msg, opts.context), publicKey);
+    },
+  }) as TRet<DSA>;
+}
+
+/**
+ * ML-DSA-ETH — Keccak-PRG-driven Dilithium-2. Byte-compatible with
+ * ETHDILITHIUM's on-chain Dilithium-2 verifier. Distinct byte-identity
+ * from {@link ml_dsa44} at every intermediate state.
+ *
+ * @experimental Not a NIST-standardized scheme. Audited ZKNox verifiers
+ * implement the matching on-chain algorithm; the off-chain implementation
+ * here tracks their Python reference.
+ */
+export const ml_dsa44eth: TRet<DSA> = /* @__PURE__ */ (() =>
+  getMlDsaEth({
+    ...PARAMS[2],
+    CRH_BYTES: 64,
+    TR_BYTES: 64,
+    C_TILDE_BYTES: 32,
   }))();
