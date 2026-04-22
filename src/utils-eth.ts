@@ -29,11 +29,7 @@ import { genCrystals } from './_crystals.ts';
  * both `encodeFalconPublicKey` (inside the ABI envelope) and
  * `encodeFalconSignature` (raw, after the salt).
  */
-function packBigEndianWords(
-  values: bigint[],
-  out: Uint8Array,
-  offset: number,
-): void {
+function packBigEndianWords(values: bigint[], out: Uint8Array, offset: number): void {
   for (let i = 0; i < values.length; i++) {
     const word = values[i] as bigint;
     const wordOffset = offset + i * 32;
@@ -69,10 +65,7 @@ function encodeUint256ArrayAbi(values: bigint[]): Uint8Array {
  * ETHFALCON/ML-DSA consumer repo. When the ML-DSA-ETH extraction lands, the
  * repo's copy is removed and this becomes the sole source of truth.
  */
-function compactPoly256(
-  coeffs: ArrayLike<number | bigint>,
-  m: number,
-): bigint[] {
+function compactPoly256(coeffs: ArrayLike<number | bigint>, m: number): bigint[] {
   if (m >= 256) throw new Error('compactPoly256: m must be less than 256');
   if ((coeffs.length * m) % 256 !== 0) {
     throw new Error('compactPoly256: total bits must be divisible by 256');
@@ -108,9 +101,7 @@ const FALCON_ROOT_OF_UNITY = 7;
 // (nm1modq). Loud assertion catches any upstream invert() drift.
 const FALCON_F_INV = 12265;
 if (FALCON_F_INV !== Number(invert(BigInt(FALCON_N), BigInt(FALCON_Q)))) {
-  throw new Error(
-    'Falcon-512 utils-eth: F_INV (nm1modq) drift — expected 12265 = invert(N, Q)',
-  );
+  throw new Error('Falcon-512 utils-eth: F_INV (nm1modq) drift — expected 12265 = invert(N, Q)');
 }
 const falconCrystals = genCrystals({
   N: FALCON_N,
@@ -147,7 +138,7 @@ const FALCON_SIG_RAW_PAYLOAD_LEN = FALCON_SALT_LEN + FALCON_COMPACT_WORDS * 32; 
 function decodeFalconPublicKey14Bit(body: Uint8Array): Uint16Array {
   if (body.length !== FALCON_PK_BODY_BYTES) {
     throw new Error(
-      `Falcon-512 pk body: expected ${FALCON_PK_BODY_BYTES} bytes, got ${body.length}`,
+      `Falcon-512 pk body: expected ${FALCON_PK_BODY_BYTES} bytes, got ${body.length}`
     );
   }
   const out = new Uint16Array(FALCON_N);
@@ -211,9 +202,7 @@ function decompressFalconSignature(body: Uint8Array): Int16Array {
       throw new Error('Falcon-512 compressed s2: negative zero');
     }
     if (v > FALCON_ALGO17_LIMIT) {
-      throw new Error(
-        `Falcon-512 compressed s2: coeff ${v} > ${FALCON_ALGO17_LIMIT}`,
-      );
+      throw new Error(`Falcon-512 compressed s2: coeff ${v} > ${FALCON_ALGO17_LIMIT}`);
     }
     out[i] = sign ? -v : v;
   }
@@ -247,13 +236,13 @@ function decompressFalconSignature(body: Uint8Array): Int16Array {
 export function encodeFalconPublicKey(rawPublicKey: Uint8Array): Uint8Array {
   if (rawPublicKey.length !== FALCON_PK_BYTES) {
     throw new Error(
-      `Falcon-512 public key: expected ${FALCON_PK_BYTES} bytes, got ${rawPublicKey.length}`,
+      `Falcon-512 public key: expected ${FALCON_PK_BYTES} bytes, got ${rawPublicKey.length}`
     );
   }
   if (rawPublicKey[0] !== FALCON_PK_HEADER_BYTE) {
     throw new Error(
       `Falcon-512 public key: expected header byte 0x${FALCON_PK_HEADER_BYTE.toString(16)}, ` +
-      `got 0x${rawPublicKey[0].toString(16)}`,
+        `got 0x${rawPublicKey[0].toString(16)}`
     );
   }
   const h = decodeFalconPublicKey14Bit(rawPublicKey.subarray(1));
@@ -261,7 +250,7 @@ export function encodeFalconPublicKey(rawPublicKey: Uint8Array): Uint8Array {
   const compact = compactPoly256(h, FALCON_COMPACT_BITS);
   if (compact.length !== FALCON_COMPACT_WORDS) {
     throw new Error(
-      `Falcon-512 pk compact length mismatch: expected ${FALCON_COMPACT_WORDS}, got ${compact.length}`,
+      `Falcon-512 pk compact length mismatch: expected ${FALCON_COMPACT_WORDS}, got ${compact.length}`
     );
   }
   return encodeUint256ArrayAbi(compact);
@@ -285,7 +274,7 @@ export function encodeFalconSignature(nobleSig: Uint8Array): Uint8Array {
   if (nobleSig[0] !== FALCON_SIG_HEADER_BYTE) {
     throw new Error(
       `Falcon-512 signature: expected header byte 0x${FALCON_SIG_HEADER_BYTE.toString(16)}, ` +
-      `got 0x${nobleSig[0].toString(16)}`,
+        `got 0x${nobleSig[0].toString(16)}`
     );
   }
   const salt = nobleSig.subarray(1, 1 + FALCON_SALT_LEN);
@@ -299,7 +288,7 @@ export function encodeFalconSignature(nobleSig: Uint8Array): Uint8Array {
   const compact = compactPoly256(s2ModQ, FALCON_COMPACT_BITS);
   if (compact.length !== FALCON_COMPACT_WORDS) {
     throw new Error(
-      `Falcon-512 sig compact length mismatch: expected ${FALCON_COMPACT_WORDS}, got ${compact.length}`,
+      `Falcon-512 sig compact length mismatch: expected ${FALCON_COMPACT_WORDS}, got ${compact.length}`
     );
   }
 
@@ -313,8 +302,7 @@ export function encodeFalconSignature(nobleSig: Uint8Array): Uint8Array {
 
 const FALCON_ETH_STATE_SIZE = 32;
 const FALCON_ETH_COUNTER_SIZE = 8;
-const FALCON_ETH_EXTENDED_STATE_SIZE =
-  FALCON_ETH_STATE_SIZE + FALCON_ETH_COUNTER_SIZE;
+const FALCON_ETH_EXTENDED_STATE_SIZE = FALCON_ETH_STATE_SIZE + FALCON_ETH_COUNTER_SIZE;
 const FALCON_ETH_CHUNKS_PER_BUFFER = 16;
 // Rejection threshold — exactly 5 * Q. Chunks ≥ KQ are discarded; chunks < KQ
 // reduce mod Q. NOT 61440 — off-by-5 silently degrades uniformity on chunks
@@ -356,10 +344,7 @@ const FALCON_ETH_KQ = 61445;
  * @param msg  Message bytes (arbitrary length).
  * @returns    Uint16Array of length 512, every element < Q (= 12289).
  */
-export function hashToPointEVM(
-  salt: Uint8Array,
-  msg: Uint8Array,
-): Uint16Array {
+export function hashToPointEVM(salt: Uint8Array, msg: Uint8Array): Uint16Array {
   // --- Initial state: keccak256(salt ‖ msg) ---
   const concat = new Uint8Array(salt.length + msg.length);
   concat.set(salt, 0);
@@ -374,7 +359,7 @@ export function hashToPointEVM(
   const extendedView = new DataView(
     extendedState.buffer,
     extendedState.byteOffset,
-    extendedState.byteLength,
+    extendedState.byteLength
   );
 
   const output = new Uint16Array(FALCON_N);
