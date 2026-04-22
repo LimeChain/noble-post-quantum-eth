@@ -2414,7 +2414,10 @@ const falcon512opts = {
   // Payload-only budget: genFalcon() adds the detached header byte and 40-byte nonce around it.
   detachedLen: 690,
 };
-export { genFalcon };
+// genFalcon is intentionally not exported: the fork exposes finished Falcon
+// instances (falcon512, falcon512padded, falcon512paddedEth, falcon1024,
+// falcon1024padded) — consumers should not compose their own variants over
+// the internal `FalconOpts` shape.
 /**
  * Falcon-512 detached-signature API with the attached helper exposed as `.attached`.
  * @example
@@ -2428,7 +2431,11 @@ export { genFalcon };
  */
 export const falcon512: TRet<Falcon> = /* @__PURE__ */ (() =>
   genFalcon({ ...falcon512opts, maxS2Len: 711 }))();
-export const falcon512paddedOpts: FalconOpts = { ...falcon512opts, padded: true, maxS2Len: 625 };
+// Shared opts bundle reused by the two `padded: true` Falcon-512 instances
+// below (falcon512padded with upstream SHAKE-256 HashToPoint and
+// falcon512paddedEth with the Keccak-256 ETH variant). Not exported —
+// consumers import the finished instances, not the opts.
+const falcon512paddedOpts: FalconOpts = { ...falcon512opts, padded: true, maxS2Len: 625 };
 /**
  * Falcon-512 padded detached-signature API with the attached helper exposed as `.attached`.
  * @example
