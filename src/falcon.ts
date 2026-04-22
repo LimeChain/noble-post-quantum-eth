@@ -23,6 +23,7 @@ import {
   u8,
 } from '@noble/hashes/utils.js';
 import { genCrystals, type TypedCons } from './_crystals.ts';
+import { hashToPointEVM } from './utils-eth.ts';
 import {
   baswap64If,
   type BytesCoderLen,
@@ -2444,6 +2445,30 @@ export const falcon512padded: TRet<Falcon> = /* @__PURE__ */ (() =>
     ...falcon512opts,
     padded: true,
     maxS2Len: 625,
+  }))();
+/**
+ * Falcon-512 padded detached-signature API with Keccak-256 counter-mode
+ * HashToPoint (Ethereum variant). Byte-identical signatures vs the
+ * ETHFALCON reference implementation — consumed by on-chain verifiers in
+ * the ZKNox-style deployment.
+ *
+ * The `hashToPointEVM` primitive is imported from `./utils-eth.ts` and
+ * injected via `genFalcon`'s internal `opts.hashToPoint?` seam. The rest
+ * of the signer surface (keygen, sign, verify, attached helper) is
+ * inherited from `falcon512padded` — only the HashToPoint binding differs.
+ *
+ * @example
+ * ```ts
+ * const { secretKey, publicKey } = falcon512paddedEth.keygen();
+ * const msg = new Uint8Array([1, 2, 3]);
+ * const sig = falcon512paddedEth.sign(msg, secretKey);
+ * falcon512paddedEth.verify(sig, msg, publicKey);
+ * ```
+ */
+export const falcon512paddedEth: TRet<Falcon> = /* @__PURE__ */ (() =>
+  genFalcon({
+    ...falcon512paddedOpts,
+    hashToPoint: hashToPointEVM,
   }))();
 
 const falcon1024opts = {
