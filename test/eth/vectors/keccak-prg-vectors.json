@@ -1,0 +1,118 @@
+{
+  "_source": "Layer 1 (`zhenfei-canonical`): 4 canonical vectors transcribed from ZKNoxHQ/ETHDILITHIUM@b9ca7f72526ecc696230d3c774a6e2c12c9b37c2 test/keccak_prng.t.sol — Solidity hex literals that the upstream test asserts against on-chain (the trust anchor for the Keccak-PRG primitive in the ZKNox deployment). Layer 2 (`python-ref-extended`): boundary cases derived from ETHDILITHIUM's KeccakPRNG Python reference (multi-inject ordering, split-extract continuation, large-extract spanning multiple keccak blocks, per-call buffer-position persistence). Regenerate against the pinned ETHDILITHIUM SHA on upstream change.",
+  "vectors": [
+    {
+      "id": "zhenfei-canonical-01",
+      "source": "zhenfei-canonical",
+      "description": "inject \"test input\" (10 B); flip; extract(32)",
+      "injects": [
+        "0x7465737420696e707574"
+      ],
+      "extracts": [
+        32
+      ],
+      "expected": [
+        "0x5b9e99370fa4b753ac6bf0d246b3cec353c84a67839f5632cb2679b4ae565601"
+      ]
+    },
+    {
+      "id": "zhenfei-canonical-02",
+      "source": "zhenfei-canonical",
+      "description": "inject \"test input\" (10 B); flip; extract(64) — Forge test documents bytes [32..64] only",
+      "injects": [
+        "0x7465737420696e707574"
+      ],
+      "extracts": [
+        64
+      ],
+      "expected": [
+        "0x5b9e99370fa4b753ac6bf0d246b3cec353c84a67839f5632cb2679b4ae565601569857b781dd8b81dd9cb45d06999916742043ff52f1cf165e161bcc9938b705"
+      ]
+    },
+    {
+      "id": "zhenfei-canonical-03",
+      "source": "zhenfei-canonical",
+      "description": "inject \"testinput\" (9 B); flip; extract(32)",
+      "injects": [
+        "0x74657374696e707574"
+      ],
+      "extracts": [
+        32
+      ],
+      "expected": [
+        "0x120f76b5b7198706bc294a942f8d17467aadb2bb1fa2cc1fecadbaba93c0dd74"
+      ]
+    },
+    {
+      "id": "zhenfei-canonical-04-stream",
+      "source": "zhenfei-canonical",
+      "description": "inject \"test sequence\" (13 B); flip; extract(80) — Forge test documents high-16-B-of-each-32-B-block slices only",
+      "injects": [
+        "0x746573742073657175656e6365"
+      ],
+      "extracts": [
+        80
+      ],
+      "expected": [
+        "0x9e96b1e50719da6f0ea5b664ac8bbac5eb409b4db770b124363b393a0c96b5d61be071eca45961aca979e88e3784a75111ae1747231a06bcc147b6c8905d2b2f5f19135442b6b848b2f51f7cb58bc583"
+      ]
+    },
+    {
+      "id": "prg-cross-extract",
+      "source": "python-ref-extended",
+      "description": "inject 32 B seed; flip; extract(5) + extract(27) — validates out-buffer-pos persistence across extract calls",
+      "injects": [
+        "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      ],
+      "extracts": [
+        5,
+        27
+      ],
+      "expected": [
+        "0x77b7caf29d",
+        "0x0c44ef38344ab0bec3724d4d73fcb0c022b364125a19ff674e1fea"
+      ]
+    },
+    {
+      "id": "prg-multi-inject",
+      "source": "python-ref-extended",
+      "description": "inject 16 B + inject 16 B; flip; extract(64) — validates absorb concatenation equivalence",
+      "injects": [
+        "0x404142434445464748494a4b4c4d4e4f",
+        "0x808182838485868788898a8b8c8d8e8f"
+      ],
+      "extracts": [
+        64
+      ],
+      "expected": [
+        "0x1cf65a25a7389cd3ed56566f5c3ca76aabfa2933e5891c29fd30a7652f3b52a3897a91c0a94070109c365d96cb794b0370f4a199004c3669e9004d2e77252420"
+      ]
+    },
+    {
+      "id": "prg-empty-seed",
+      "source": "python-ref-extended",
+      "description": "no inject; flip; extract(32) — validates keccak256(b\"\") initial state",
+      "injects": [],
+      "extracts": [
+        32
+      ],
+      "expected": [
+        "0x581e5628147dbbb91f91b8ab85d66baa9dfc56c35931210bf14524e0650061a8"
+      ]
+    },
+    {
+      "id": "prg-ml-dsa-shaped-seed",
+      "source": "python-ref-extended",
+      "description": "inject 34 B (ρ ‖ j_uint16_le ‖ i_uint16_le shape); flip; extract(408) — realistic ExpandA rejection-sampling chunk",
+      "injects": [
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0100"
+      ],
+      "extracts": [
+        408
+      ],
+      "expected": [
+        "0x90519c4b0be4dbd70daac5821681b1af33a533fca154c89bfc68a3fae03bbb28de1285cf532cf610092bfb468270de75731c499f16d03e8f83fe3f558c7ccb499afafe421b6b1817b906297114dd5c6b803926e5e6dbdaf3d74adca320a3329e0aa77ac0d1fcbe3129a28427761571144e354d11f12c0a4953e4ebe2ac2228c6f46da418a43eb0be56bde8c1db3b240bd8b985aa491ef13dacf246761498423279741b2bd8c38ca967c3b8a764a94e66c9f1b4e0924d4aaec631de12916dd0f4c39c4e5d21fae9c2a339cc3e6581c58fccebfdf5920b19ff1aafbaa7704ed882f8e60b2279e4565486e163677e072bfec1e0c9a35efa52c6117c1d929033f832e594adfc0b816c10801264093e07e67e1ec17b3041df7577b2a88b002e4a12b5cb473f2a31b248aae393fd3ae7c20b3a4a4bb6c499e5dc79f37460e69ed06a5fb6d7e6cc4c68ee31c5bbbfc6112ddec7c1bbe4614c0d7f61f002fa12090c4b0166b853ac27706d8653f7298a08fbe9ac1ad197bb38dd1e59b38798c8a5a41cd79496d904f16c92eee8bc52978a8ebf8ffa93f409ca4a2a36"
+      ]
+    }
+  ]
+}
