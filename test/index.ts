@@ -5,5 +5,6 @@ import './falcon.test.ts';
 import './hybrid.test.ts';
 import './wycheproof.test.ts';
 // import './errors.test.ts';
+import './eth/index.ts';
 
 should.runWhen(import.meta.url);
