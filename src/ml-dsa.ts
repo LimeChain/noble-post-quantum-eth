@@ -1073,8 +1073,7 @@ function getMlDsaEth(opts_: TArg<MlDsaEthOpts>): TRet<DSA> {
 
       const xofPrime = makeXofGet(rhoPrime, EXPAND_S_BLOCK);
       const s1: Poly[] = [];
-      for (let i = 0; i < L; i++)
-        s1.push(RejBoundedPolyEth(xofPrime(i & 0xff, (i >> 8) & 0xff)));
+      for (let i = 0; i < L; i++) s1.push(RejBoundedPolyEth(xofPrime(i & 0xff, (i >> 8) & 0xff)));
       const s2: Poly[] = [];
       for (let i = L; i < L + K; i++)
         s2.push(RejBoundedPolyEth(xofPrime(i & 0xff, (i >> 8) & 0xff)));

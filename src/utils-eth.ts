@@ -104,10 +104,7 @@ function compactPoly256(coeffs: ArrayLike<number | bigint>, m: number): bigint[]
  * by the caller into a single-row module) into 32-bit-per-coefficient
  * bigint words for the ZKNox on-chain verifier.
  */
-function compactModule256(
-  data: ArrayLike<ArrayLike<number | bigint>>[],
-  m: number
-): bigint[][][] {
+function compactModule256(data: ArrayLike<ArrayLike<number | bigint>>[], m: number): bigint[][][] {
   const res: bigint[][][] = [];
   for (const row of data) {
     const inner: bigint[][] = [];
@@ -236,11 +233,7 @@ function encodeUint256Module3Abi(data: bigint[][][]): Uint8Array {
  * where each tail is `length(32) ‖ data ‖ zero-padding-to-32B-multiple`.
  * The head is 3 × 32 bytes; offsets are relative to the start of the head.
  */
-function encodeThreeBytesTupleAbi(
-  a: Uint8Array,
-  b: Uint8Array,
-  c: Uint8Array
-): Uint8Array {
+function encodeThreeBytesTupleAbi(a: Uint8Array, b: Uint8Array, c: Uint8Array): Uint8Array {
   const pad = (data: Uint8Array): Uint8Array => {
     const paddedLen = Math.ceil(data.length / 32) * 32;
     const t = new Uint8Array(32 + paddedLen);
