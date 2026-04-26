@@ -63,7 +63,7 @@ const HASHTOPOINT_VECTORS = JSON.parse(
   readFileSync(join(__dirname, 'vectors/hashtopoint-vectors.json'), 'utf8')
 );
 const ENCODER_VECTORS = JSON.parse(
-  readFileSync(join(__dirname, 'vectors/encoder-vectors.json'), 'utf8')
+  readFileSync(join(__dirname, 'vectors/falcon-encoder-vectors.json'), 'utf8')
 );
 
 describe('Falcon-ETH', () => {
@@ -148,7 +148,7 @@ describe('Falcon-ETH', () => {
     deepStrictEqual(falcon.falcon512paddedEth.verify(padSig, msg, k1.publicKey), false);
   });
 
-  // Cross-references encoder-vectors.json to the .rsp corpus by `count`, runs the same DRBG
+  // Cross-references falcon-encoder-vectors.json to the .rsp corpus by `count`, runs the same DRBG
   // advance pattern as the byte-identity test, and asserts:
   //   - encodeFalconPublicKey returns 1088 B (dynamic uint256[] ABI: 32 B offset + 32 B length
   //     + 1024 B body); body bytes match the 1024 B fixed `uint256[32]` reference from
